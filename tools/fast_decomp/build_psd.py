@@ -35,7 +35,7 @@ from utils import inference_utils as iu
 
 def write_algo_depth_and_psd(layer_dir, workers=8, min_margin=0.08, min_cov=0.15,
                              save_psd=True, verbose=True, patch_layers=False,
-                             patch_dilate=6, patch_color_thresh=45):
+                             patch_dilate=6, patch_color_thresh=45, silhouette_gap=3):
     """Run the occlusion z-order, write synthetic <tag>_depth.png + info.json,
     then let the repo's further_extr() export the PSD. Returns the layer order."""
     d = layer_dir
@@ -45,7 +45,8 @@ def write_algo_depth_and_psd(layer_dir, workers=8, min_margin=0.08, min_cov=0.15
     if patch_layers:
         from patch_layers import patch
         print("[patch] repairing layer content with the source image", flush=True)
-        patch(layer_dir, order, dilate=patch_dilate, color_thresh=patch_color_thresh, verbose=verbose)
+        patch(layer_dir, order, dilate=patch_dilate, color_thresh=patch_color_thresh,
+              silhouette_gap=silhouette_gap, verbose=verbose)
 
     # bottom layer -> largest depth value (dump_parts_psd sorts descending)
     h = w = None
@@ -80,11 +81,14 @@ def main():
     ap.add_argument("--patch", action="store_true", help="repair layer content using the source image")
     ap.add_argument("--patch_dilate", type=int, default=6)
     ap.add_argument("--patch_color_thresh", type=int, default=45)
+    ap.add_argument("--silhouette_gap", type=int, default=3,
+                    help="px around the outline that are restored from the source image")
     args = ap.parse_args()
     write_algo_depth_and_psd(args.layer_dir, workers=args.workers, min_margin=args.min_margin,
                              min_cov=args.min_cov, save_psd=args.save_psd,
                              patch_layers=args.patch, patch_dilate=args.patch_dilate,
-                             patch_color_thresh=args.patch_color_thresh)
+                             patch_color_thresh=args.patch_color_thresh,
+                             silhouette_gap=args.silhouette_gap)
 
 
 if __name__ == "__main__":

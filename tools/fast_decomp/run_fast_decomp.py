@@ -85,6 +85,8 @@ def main():
     ap.add_argument("--no_patch", dest="patch_layers", action="store_false")
     ap.add_argument("--patch_dilate", type=int, default=6)
     ap.add_argument("--patch_color_thresh", type=int, default=45)
+    ap.add_argument("--silhouette_gap", type=int, default=3,
+                    help="px around the outline restored from the source image (kills the white fringe)")
     ap.add_argument("--group_offload", action="store_true")
     ap.add_argument("--repo_id_layerdiff", default="layerdifforg/seethroughv0.0.2_layerdiff3d")
     ap.add_argument("--repo_id_depth", default="24yearsold/seethroughv0.0.1_marigold")
@@ -161,7 +163,8 @@ def main():
                                                  save_psd=args.save_to_psd,
                                                  patch_layers=args.patch_layers,
                                                  patch_dilate=args.patch_dilate,
-                                                 patch_color_thresh=args.patch_color_thresh)
+                                                 patch_color_thresh=args.patch_color_thresh,
+                                                 silhouette_gap=args.silhouette_gap)
                 print(f"[zorder] {len(order)} layers ordered by occlusion (no depth model)", flush=True)
             else:
                 iu.apply_marigold(src, args.repo_id_depth, save_dir=args.save_dir, seed=args.seed,
