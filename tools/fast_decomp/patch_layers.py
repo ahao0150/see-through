@@ -32,36 +32,75 @@ from scipy import ndimage
 
 
 
-def character_mask(src_rgba, white_thresh=245, min_bg_ratio=0.05):
+def detect_backdrop_color(src_rgba, quant=8):
+    """Estimate the backdrop colour as the dominant colour of the border ring.
+
+    Works for any flat backdrop (white, green screen, ...). Returns an int16 RGB
+    triple, or None when there is nothing to sample.
+    """
+    a = src_rgba[..., 3]
+    rgb = src_rgba[..., :3].astype(np.int16)
+    h, w = a.shape
+    k = max(3, min(h, w) // 60)
+    border = np.zeros(a.shape, bool)
+    border[:k, :] = border[-k:, :] = True
+    border[:, :k] = border[:, -k:] = True
+    px = rgb[border & (a > 0)]
+    if len(px) == 0:
+        return None
+    q = (px // quant) * quant
+    vals, counts = np.unique(q, axis=0, return_counts=True)
+    return vals[int(np.argmax(counts))].astype(np.int16)
+
+
+def backdrop_like(src_rgba, bg_color, tol=16):
+    """Pixels whose colour matches the backdrop within `tol` (per channel).
+
+    Black and white backdrops are the supported cases; the tolerance is applied to
+    the grey level, so a white backdrop test is "all channels >= 255-tol" and a
+    black one is "all channels <= tol".
+    """
+    if bg_color is None:
+        return np.zeros(src_rgba.shape[:2], bool)
+    rgb = src_rgba[..., :3].astype(np.int16)
+    bg = np.asarray(bg_color, np.int16)
+    return (np.abs(rgb - bg).max(-1) <= tol) & (src_rgba[..., 3] > 0)
+
+
+def _touches_border(m):
+    return bool(m[0, :].any() or m[-1, :].any() or m[:, 0].any() or m[:, -1].any())
+
+
+def character_mask(src_rgba, bg_tol=16, min_bg_ratio=0.05, silent=False):
     """Mask of the character itself.
 
-    Test images are often painted on an opaque white backdrop (every backdrop pixel
-    has alpha=255), so the alpha channel only marks the padded area and cannot be
-    trusted. The backdrop is therefore found as the largest pure-white connected
-    region whose size is at least `min_bg_ratio` of the canvas and which touches the
-    transparent padding (i.e. it sits outside the character). White areas *inside*
-    the character (highlights, white shoes, 98 px in the sample) are far smaller and
-    stay part of the character.
+    The backdrop is the largest connected region matching the detected backdrop
+    colour, provided it covers a decent share of the canvas and either touches the
+    canvas border (no padding) or leans on the transparent padding. Everything else
+    counts as character. Works with white, green-screen or any other flat backdrop.
     """
     from scipy import ndimage
     a = src_rgba[..., 3]
-    rgb = src_rgba[..., :3].astype(np.int16)
-    white = (rgb >= white_thresh).all(-1)
     person = a > 0
-    lab, n = ndimage.label(white)
+    bg_color = detect_backdrop_color(src_rgba)
+    bg_like = backdrop_like(src_rgba, bg_color, bg_tol)
+    if not silent:
+        print(f"[backdrop] detected colour RGB{tuple(int(v) for v in bg_color)} "
+              f"-> {int(bg_like.sum())} px match (tol={bg_tol})", flush=True)
+    lab, n = ndimage.label(bg_like)
     if n:
-        sizes = ndimage.sum(white, lab, index=np.arange(1, n + 1))
+        sizes = ndimage.sum(bg_like, lab, index=np.arange(1, n + 1))
         k = int(np.argmax(sizes)) + 1
-        if sizes[k - 1] >= min_bg_ratio * white.size:
+        if sizes[k - 1] >= min_bg_ratio * bg_like.size:
             blob = lab == k
-            outside = (a == 0) | np.zeros_like(a, bool)
-            touches_outside = ndimage.binary_dilation(blob, iterations=2) & outside
-            if touches_outside.any():
+            leans_out = _touches_border(blob) or bool(
+                (ndimage.binary_dilation(blob, iterations=2) & (a == 0)).any())
+            if leans_out:
                 person = person & ~blob
     return person
 
 
-def complete_silhouette(layer_dir, order_bottom_first, max_gap=3, verbose=True):
+def complete_silhouette(layer_dir, order_bottom_first, max_gap=3, bg_tol=16, verbose=True):
     """Close the anti-aliased rim gap between the layer masks and the artwork.
 
     The decomposed layers' masks stop just inside the artwork's silhouette, so the
@@ -76,7 +115,7 @@ def complete_silhouette(layer_dir, order_bottom_first, max_gap=3, verbose=True):
     from scipy import ndimage
     src = np.asarray(Image.open(osp.join(layer_dir, "src_img.png")).convert("RGBA"))
     sa = src[..., 3]
-    person = character_mask(src)
+    person = character_mask(src, bg_tol=bg_tol, silent=True)
 
     tags = [t for t in order_bottom_first if osp.exists(osp.join(layer_dir, t + ".png"))]
     imgs = {t: np.asarray(Image.open(osp.join(layer_dir, t + ".png")).convert("RGBA")).copy()
@@ -91,7 +130,7 @@ def complete_silhouette(layer_dir, order_bottom_first, max_gap=3, verbose=True):
     uncovered = owner < 0
     dist, inds = ndimage.distance_transform_edt(uncovered, return_indices=True)
     nearest = owner[inds[0], inds[1]]
-    pockets = backdrop_gap_mask(src)
+    pockets = backdrop_gap_mask(src, bg_tol=bg_tol)
     gap = uncovered & (sa > 0) & person & ~pockets & (dist <= max_gap) & (nearest >= 0)
     if verbose:
         print(f"[silhouette] rim pixels restored: {int(gap.sum())} (within {max_gap}px)")
@@ -112,8 +151,7 @@ def complete_silhouette(layer_dir, order_bottom_first, max_gap=3, verbose=True):
     return int(gap.sum())
 
 
-def backdrop_gap_mask(src_rgba, white_thresh=245, max_blob=500, max_dist=10,
-                      gap_layers=None, src_path=None, verbose=False):
+def backdrop_gap_mask(src_rgba, bg_tol=16, max_blob=500, max_dist=10, verbose=False):
     """Pure-white pockets that belong to the backdrop but are enclosed by the art.
 
     The artwork's backdrop is the largest white connected region. Any *other* white
@@ -123,8 +161,8 @@ def backdrop_gap_mask(src_rgba, white_thresh=245, max_blob=500, max_dist=10,
     the backdrop and are kept.
     """
     from scipy import ndimage
-    a = src_rgba[..., 3]
-    white = (src_rgba[..., :3] >= white_thresh).all(-1) & (a > 0)
+    bg_color = detect_backdrop_color(src_rgba)
+    white = backdrop_like(src_rgba, bg_color, bg_tol)
     lab, n = ndimage.label(white)
     if n == 0:
         return np.zeros(white.shape, bool)
@@ -143,7 +181,7 @@ def backdrop_gap_mask(src_rgba, white_thresh=245, max_blob=500, max_dist=10,
 
 
 def remove_backdrop_gaps(layer_dir, order_bottom_first, max_blob=500, max_dist=10,
-                         white_thresh=245, lum_thresh=140, verbose=True):
+                         bg_tol=16, lum_thresh=140, verbose=True):
     """Clear backdrop pockets from every layer so the PSD stays transparent there.
 
     Candidate pockets come from geometry (small white blob next to the backdrop).
@@ -155,11 +193,12 @@ def remove_backdrop_gaps(layer_dir, order_bottom_first, max_blob=500, max_dist=1
     """
     from scipy import ndimage as _nd
     src = np.asarray(Image.open(osp.join(layer_dir, "src_img.png")).convert("RGBA"))
-    cands = backdrop_gap_mask(src, white_thresh=white_thresh, max_blob=max_blob, max_dist=max_dist)
+    bg_color = detect_backdrop_color(src)
+    cands = backdrop_gap_mask(src, bg_tol=bg_tol, max_blob=max_blob, max_dist=max_dist)
 
     # Judge every white blob on its own (labelling the merged candidate mask would
     # fuse an eye highlight with a nearby hair gap and clear both).
-    white_all = (src[..., :3] >= white_thresh).all(-1) & (src[..., 3] > 0)
+    white_all = backdrop_like(src, bg_color, bg_tol)
     lab, n = _nd.label(white_all)
     sizes = _nd.sum(white_all, lab, index=np.arange(1, n + 1))
     main = int(np.argmax(sizes)) + 1
@@ -200,13 +239,99 @@ def remove_backdrop_gaps(layer_dir, order_bottom_first, max_blob=500, max_dist=1
     return removed
 
 
+def backdrop_region(src_rgba, bg_color, tol=16):
+    """The backdrop *region*: colour-matching pixels connected to the canvas border.
+
+    Colour matching alone cannot tell a white backdrop from the character's white
+    clothing, so the region is restricted to the component that reaches the border
+    or leans on the transparent padding. Enclosed white content (socks, shirts,
+    highlights) is left alone.
+    """
+    from scipy import ndimage as _nd
+    if bg_color is None:
+        return np.zeros(src_rgba.shape[:2], bool)
+    a = src_rgba[..., 3]
+    near = backdrop_like(src_rgba, bg_color, tol)
+    lab, n = _nd.label(near)
+    if n == 0:
+        return near
+    keep = set()
+    for idx in np.unique(np.concatenate([lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]])):
+        if idx != 0:
+            keep.add(int(idx))
+    if not keep:
+        return near
+    region = np.isin(lab, list(keep))
+    # transparent padding (from centre_square_pad_resize) also counts as backdrop
+    region |= (a == 0)
+    return region
+
+
+def backdrop_kind(bg_color):
+    """Classify the detected backdrop. Only white and black are colour-keyed.
+
+    A tinted backdrop (pink, green screen, ...) is too close to pale character
+    colours for any per-channel tolerance: the sample pink background is within
+    16/255 of the character's skin, so colour keying there eats the skin. For
+    those we refuse to key and keep the layers intact.
+    """
+    b = np.asarray(bg_color, np.float32)
+    # near-white additionally demands low saturation: the sample pink backdrop
+    # (248, 216, 216) has min=216 and would otherwise pass a brightness-only test,
+    # and pale skin sits within its tolerance.
+    if b.min() >= 200.0 and (b.max() - b.min()) <= 24.0:
+        return "white"
+    if b.max() <= 56.0:
+        return "black"
+    return None
+
+
+def drop_backdrop_pixels(layer_dir, order_bottom_first, bg_tol=16, verbose=True):
+    """Make layer pixels that *are* the backdrop colour transparent.
+
+    Deliberately conservative: no colour reconstruction, no alpha estimation, so
+    outlines are never touched. Only pixels whose colour matches the detected
+    backdrop (within bg_tol) lose their alpha - that is what removes the white /
+    black fringe that anti-aliasing blends into the layer border.
+    """
+    src = np.asarray(Image.open(osp.join(layer_dir, "src_img.png")).convert("RGBA"))
+    bg = detect_backdrop_color(src)
+    region = backdrop_region(src, bg, bg_tol)
+    kind = backdrop_kind(bg)
+    if kind is None:
+        if verbose:
+            print(f"[drop-backdrop] backdrop RGB{tuple(int(v) for v in bg)} is neither white "
+                  f"nor black - colour keying skipped (character content would be eaten)",
+                  flush=True)
+        return 0
+    removed = 0
+    per = []
+    for tag in order_bottom_first:
+        p = osp.join(layer_dir, tag + ".png")
+        if not osp.exists(p):
+            continue
+        img = np.asarray(Image.open(p).convert("RGBA")).copy()
+        m = img[..., 3] > 0
+        hit = m & region
+        n = int(hit.sum())
+        if n:
+            img[hit, 3] = 0
+            Image.fromarray(img).save(p)
+            removed += n
+            per.append((tag, n))
+    if verbose:
+        print(f"[drop-backdrop] removed {removed} backdrop-coloured pixels from layers "
+              f"{per}", flush=True)
+    return removed
+
+
 def patch(layer_dir, order_bottom_first, out_dir=None, dilate=6, color_thresh=45,
           silhouette_gap=3, gap_max_blob=500, gap_max_dist=10, gap_lum_thresh=140,
-          verbose=True):
+          bg_tol=16, verbose=True):
     out_dir = out_dir or layer_dir
     os.makedirs(out_dir, exist_ok=True)
     orig = np.asarray(Image.open(osp.join(layer_dir, "src_img.png")).convert("RGBA"))
-    person = character_mask(orig)
+    person = character_mask(orig, bg_tol=bg_tol, silent=True)
 
     imgs = {}
     for tag in order_bottom_first:
@@ -246,9 +371,15 @@ def patch(layer_dir, order_bottom_first, out_dir=None, dilate=6, color_thresh=45
         if verbose:
             print(f"  {tag:<12} mask_px={int(m.sum()):>7} visible={v:>7}")
 
-    complete_silhouette(layer_dir, order_bottom_first, max_gap=silhouette_gap, verbose=verbose)
+    # Order matters: the silhouette is completed LAST so the artwork's own
+    # anti-aliased rim (near-white pixels next to a white backdrop, which the colour
+    # key would otherwise drop) is put back from the source image.
     remove_backdrop_gaps(layer_dir, order_bottom_first, max_blob=gap_max_blob,
-                         max_dist=gap_max_dist, lum_thresh=gap_lum_thresh, verbose=verbose)
+                         max_dist=gap_max_dist, bg_tol=bg_tol, lum_thresh=gap_lum_thresh,
+                         verbose=verbose)
+    drop_backdrop_pixels(layer_dir, order_bottom_first, bg_tol=bg_tol, verbose=verbose)
+    complete_silhouette(layer_dir, order_bottom_first, max_gap=silhouette_gap, bg_tol=bg_tol,
+                        verbose=verbose)
     return stats
 
 
@@ -265,6 +396,8 @@ def main():
     ap.add_argument("--gap_max_dist", type=int, default=10,
                     help="max distance of a pocket to the backdrop (px); real hair gaps are "
                          "within a few px, eyes/glasses sit 25-35 px away (safety margin)")
+    ap.add_argument("--bg_tol", type=int, default=16,
+                    help="per-channel tolerance when matching the backdrop (black/white)")
     ap.add_argument("--gap_lum_thresh", type=float, default=140,
                     help="pockets whose surroundings are brighter than this are protected (eyes)")
     args = ap.parse_args()
@@ -273,7 +406,7 @@ def main():
     patch(args.layer_dir, order, args.out_dir, dilate=args.dilate,
           color_thresh=args.color_thresh, silhouette_gap=args.silhouette_gap,
           gap_max_blob=args.gap_max_blob, gap_max_dist=args.gap_max_dist,
-          gap_lum_thresh=args.gap_lum_thresh)
+          gap_lum_thresh=args.gap_lum_thresh, bg_tol=args.bg_tol)
 
 
 if __name__ == "__main__":

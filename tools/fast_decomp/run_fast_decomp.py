@@ -93,40 +93,50 @@ def main():
     args = ap.parse_args()
 
     srcs = find_all_imgs(args.srcp, abs_path=True) if osp.isdir(args.srcp) else [args.srcp]
+    setup_done = False
     for src in srcs:
         seed_everything(args.seed)
-        t0 = time.time()
-        iu.apply_layerdiff(src, args.repo_id_layerdiff, save_dir=osp.join(args.save_dir, "_warm"),
-                           seed=args.seed, resolution=args.resolution,
-                           disable_progressbar=True, num_inference_steps=1,
-                           group_offload=args.group_offload)
-        pipe = iu.layerdiff_pipeline
-        build_s = time.time() - t0
 
-        # --- LoRA + official 4-step sampling config -------------------------
-        _peft._SET_ADAPTER_SCALE_FN_MAPPING.setdefault(
-            type(pipe.unet).__name__, _peft._SET_ADAPTER_SCALE_FN_MAPPING["UNet2DConditionModel"])
-        te1, te2 = pipe.text_encoder, pipe.text_encoder_2
-        lora_file = lora_path(args.lora)
-        pipe.load_lora_weights(lora_file, adapter_name="hyper_sd")
-        pipe.text_encoder, pipe.text_encoder_2 = te1, te2      # fail loudly, not silently
-        pipe.unet.to(dtype=torch.bfloat16)
-        pipe.unet.set_adapters(["hyper_sd"], weights=[1.0])
-        pipe.unet.fuse_lora(lora_scale=1.0, adapter_names=["hyper_sd"])
-        pipe.unet.to(dtype=torch.bfloat16)
+        if not setup_done:
+            # Model construction, LoRA injection and scheduler wiring happen once
+            # for the whole batch - the pipeline is cached in inference_utils and
+            # repeated load_lora_weights()/fuse_lora() calls would just burn time.
+            t0 = time.time()
+            iu.apply_layerdiff(src, args.repo_id_layerdiff, save_dir=osp.join(args.save_dir, "_warm"),
+                               seed=args.seed, resolution=args.resolution,
+                               disable_progressbar=True, num_inference_steps=1,
+                               group_offload=args.group_offload)
+            pipe = iu.layerdiff_pipeline
+            build_s = time.time() - t0
 
-        known = set(DDIMScheduler().config.keys())
-        cfg = {k: v for k, v in dict(pipe.scheduler.config).items() if k in known}
-        cfg["timestep_spacing"] = "trailing"
-        pipe.scheduler = DDIMScheduler(**cfg)
+            _peft._SET_ADAPTER_SCALE_FN_MAPPING.setdefault(
+                type(pipe.unet).__name__, _peft._SET_ADAPTER_SCALE_FN_MAPPING["UNet2DConditionModel"])
+            te1, te2 = pipe.text_encoder, pipe.text_encoder_2
+            lora_file = lora_path(args.lora)
+            pipe.load_lora_weights(lora_file, adapter_name="hyper_sd")
+            pipe.text_encoder, pipe.text_encoder_2 = te1, te2  # keep the real encoders
+            pipe.unet.to(dtype=torch.bfloat16)
+            pipe.unet.set_adapters(["hyper_sd"], weights=[1.0])
+            pipe.unet.fuse_lora(lora_scale=1.0, adapter_names=["hyper_sd"])
+            pipe.unet.to(dtype=torch.bfloat16)
 
-        cls, orig = type(pipe), type(pipe).__call__
-        def patched(self, *a, __orig=orig, **kw):
-            kw["guidance_scale"] = args.cfg
-            return __orig(self, *a, **kw)
-        cls.__call__ = patched
-        print(f"[setup] lora={osp.basename(lora_file)} steps={args.steps} "
-              f"cfg={args.cfg} scheduler=DDIM(trailing) build={build_s:.1f}s", flush=True)
+            known = set(DDIMScheduler().config.keys())
+            cfg = {k: v for k, v in dict(pipe.scheduler.config).items() if k in known}
+            cfg["timestep_spacing"] = "trailing"
+            pipe.scheduler = DDIMScheduler(**cfg)
+
+            cls, orig = type(pipe), type(pipe).__call__
+            def patched(self, *a, __orig=orig, **kw):
+                kw["guidance_scale"] = args.cfg
+                return __orig(self, *a, **kw)
+            cls.__call__ = patched
+
+            setup_done = True
+            print(f"[setup] lora={osp.basename(lora_file)} steps={args.steps} cfg={args.cfg} "
+                  f"scheduler=DDIM(trailing) build={build_s:.1f}s (reused for the whole batch)",
+                  flush=True)
+        else:
+            build_s = 0.0
 
         # --- layer decomposition -------------------------------------------
         # head_detail=off skips the 2nd (head) pass entirely: those 11 fine layers

@@ -35,7 +35,9 @@ from utils import inference_utils as iu
 
 def write_algo_depth_and_psd(layer_dir, workers=8, min_margin=0.08, min_cov=0.15,
                              save_psd=True, verbose=True, patch_layers=False,
-                             patch_dilate=6, patch_color_thresh=45, silhouette_gap=3):
+                             patch_dilate=6, patch_color_thresh=45, silhouette_gap=3,
+                             gap_max_blob=500, gap_max_dist=10, gap_lum_thresh=140,
+                             bg_tol=16):
     """Run the occlusion z-order, write synthetic <tag>_depth.png + info.json,
     then let the repo's further_extr() export the PSD. Returns the layer order."""
     d = layer_dir
@@ -46,7 +48,9 @@ def write_algo_depth_and_psd(layer_dir, workers=8, min_margin=0.08, min_cov=0.15
         from patch_layers import patch
         print("[patch] repairing layer content with the source image", flush=True)
         patch(layer_dir, order, dilate=patch_dilate, color_thresh=patch_color_thresh,
-              silhouette_gap=silhouette_gap, verbose=verbose)
+              silhouette_gap=silhouette_gap, gap_max_blob=gap_max_blob,
+              gap_max_dist=gap_max_dist, gap_lum_thresh=gap_lum_thresh,
+              bg_tol=bg_tol, verbose=verbose)
 
     # bottom layer -> largest depth value (dump_parts_psd sorts descending)
     h = w = None
