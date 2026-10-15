@@ -12,6 +12,7 @@ bottom-first.
 """
 
 # Portable paths: everything is resolved relative to this file / the repo root.
+import json
 import os
 import os.path as osp
 import sys
@@ -43,6 +44,16 @@ def write_algo_depth_and_psd(layer_dir, workers=8, min_margin=0.08, min_cov=0.15
     d = layer_dir
     order, rels = solve(d, workers=workers, min_margin=min_margin, min_cov=min_cov, verbose=verbose)
     n = max(len(order), 1)
+
+    # persist the solved order so downstream consumers (ComfyUI nodes, re-exports)
+    # can composite or rebuild the PSD without re-running the solver
+    try:
+        with open(osp.join(layer_dir, "zorder.json"), "w", encoding="utf-8") as fh:
+            json.dump({"order_bottom_first": order,
+                       "relations": rels}, fh, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        if verbose:
+            print(f"[zorder] could not write zorder.json: {exc}", flush=True)
 
     if patch_layers:
         from patch_layers import patch

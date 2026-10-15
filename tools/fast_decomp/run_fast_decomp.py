@@ -52,8 +52,33 @@ LORA_FILES = {
 }
 
 
+def _local_lora(name):
+    """Look the LoRA up in the local HF cache without touching the network."""
+    import glob
+
+    fname = LORA_FILES[name]
+    hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    pattern = osp.join(hf_home, "hub", "models--" + HYPER_SD_REPO.replace("/", "--"),
+                       "snapshots", "*", fname)
+    hits = sorted(glob.glob(pattern))
+    if hits:
+        return hits[-1]
+    # also accept a loose file next to the repo's assets
+    fallback = osp.join(REPO, "models", "hyper_sd", fname)
+    if osp.exists(fallback):
+        return fallback
+    return None
+
+
 def lora_path(name):
-    """Resolve a Hyper-SD LoRA from the local HF cache, downloading on first use."""
+    """Resolve a Hyper-SD LoRA, preferring the local cache over the network.
+
+    The network lookup is only a fallback for a first-time setup: a transient Hugging
+    Face hiccup must not break a run whose weights are already on disk.
+    """
+    local = _local_lora(name)
+    if local:
+        return local
     from huggingface_hub import hf_hub_download
     return hf_hub_download(HYPER_SD_REPO, LORA_FILES[name])
 
